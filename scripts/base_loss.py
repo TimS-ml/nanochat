@@ -1,10 +1,39 @@
 """
-Loads a checkpoint, and:
-- Evaluates the loss on a larger chunk of train/val splits
-- Samples from the model
+Base Model Loss Evaluation and Sampling Script
 
-Example run as:
-torchrun --standalone --nproc_per_node=8 -m scripts.base_loss
+This script loads a pretrained base model checkpoint and performs two tasks:
+1. Evaluates loss (in bits per byte) on train and validation splits
+2. Generates sample completions from the model on common prompts
+
+The bits-per-byte (bpb) metric is preferable to standard loss because it's invariant
+to the tokenizer's vocabulary size, making it easier to compare models with different
+tokenizers.
+
+This is useful for:
+- Checking model quality after training
+- Comparing different checkpoints
+- Debugging model behavior through samples
+- Measuring generalization (train vs val loss)
+
+Usage examples:
+
+Distributed evaluation (recommended):
+    torchrun --standalone --nproc_per_node=8 -m scripts.base_loss
+
+Single GPU:
+    python -m scripts.base_loss
+
+Evaluate specific checkpoint:
+    python -m scripts.base_loss --model_tag=d20 --model_step=10000
+
+Adjust evaluation size:
+    python -m scripts.base_loss --split_tokens=10485760  # 10M tokens
+
+The script will:
+1. Load the model from base_checkpoints/
+2. Evaluate loss on train/val splits (distributed across GPUs)
+3. Generate sample completions (on master process only)
+4. Print results to console and log to experiment report
 """
 import os
 from contextlib import nullcontext

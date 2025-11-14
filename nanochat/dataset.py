@@ -1,10 +1,25 @@
 """
-The base/pretraining dataset is a set of parquet files.
-This file contains utilities for:
-- iterating over the parquet files and yielding documents from it
-- download the files on demand if they are not on disk
+Dataset Management - Handling the base pre-training dataset (FineWeb-Edu).
 
-For details of how the dataset was prepared, see `repackage_data_reference.py`.
+The pre-training dataset consists of Parquet files containing web text documents.
+This module provides utilities for:
+- Listing and iterating over Parquet files
+- Downloading dataset shards on demand from HuggingFace
+- Batched iteration optimized for distributed training
+- Automatic retry logic with exponential backoff
+
+Dataset structure:
+- ~1800+ shards of Parquet files (shard_00000.parquet to shard_01822.parquet)
+- Each shard contains multiple row groups for efficient streaming
+- Last shard reserved for validation, others for training
+- Column format: {'text': string} - raw document text
+
+Data source: FineWeb-Edu 100BT subset
+- High-quality educational web text
+- Pre-filtered and deduplicated
+- Hosted on HuggingFace
+
+For dataset preparation details, see `dev/repackage_data_reference.py`.
 """
 
 import os
@@ -17,21 +32,32 @@ from multiprocessing import Pool
 from nanochat.common import get_base_dir
 
 # -----------------------------------------------------------------------------
-# The specifics of the current pretraining dataset
+# Dataset configuration for the current pre-training dataset
 
-# The URL on the internet where the data is hosted and downloaded from on demand
+# Base URL for downloading dataset shards from HuggingFace
 BASE_URL = "https://huggingface.co/datasets/karpathy/fineweb-edu-100b-shuffle/resolve/main"
-MAX_SHARD = 1822 # the last datashard is shard_01822.parquet
-index_to_filename = lambda index: f"shard_{index:05d}.parquet" # format of the filenames
+MAX_SHARD = 1822  # Maximum shard index (0 to 1822 = 1823 total shards)
+# Filename format: converts index to "shard_00000.parquet" format
+index_to_filename = lambda index: f"shard_{index:05d}.parquet"
+# Local directory for storing downloaded dataset shards
 base_dir = get_base_dir()
 DATA_DIR = os.path.join(base_dir, "base_data")
-os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)  # Create directory if it doesn't exist
 
 # -----------------------------------------------------------------------------
 # These functions are useful utilities to other modules, can/should be imported
 
 def list_parquet_files(data_dir=None):
-    """ Looks into a data dir and returns full paths to all parquet files. """
+    """
+    List all Parquet files in the data directory.
+
+    Args:
+        data_dir: Directory to search (default: DATA_DIR)
+
+    Returns:
+        List of full paths to Parquet files, sorted by name
+        Excludes temporary .tmp files from incomplete downloads
+    """
     data_dir = DATA_DIR if data_dir is None else data_dir
     parquet_files = sorted([
         f for f in os.listdir(data_dir)
@@ -42,9 +68,27 @@ def list_parquet_files(data_dir=None):
 
 def parquets_iter_batched(split, start=0, step=1):
     """
-    Iterate through the dataset, in batches of underlying row_groups for efficiency.
-    - split can be "train" or "val". the last parquet file will be val.
-    - start/step are useful for skipping rows in DDP. e.g. start=rank, step=world_size
+    Iterate through the dataset in batches of row groups for efficient streaming.
+
+    This is optimized for distributed training where each rank processes different row groups.
+
+    Args:
+        split: "train" or "val" - determines which files to iterate
+               - train: all files except the last one
+               - val: only the last file
+        start: Starting row group index (useful for DDP, e.g., start=rank)
+        step: Step size between row groups (useful for DDP, e.g., step=world_size)
+
+    Yields:
+        List of text documents (strings) from each row group
+
+    Example:
+        # In distributed training with 4 GPUs:
+        # Rank 0: processes row groups 0, 4, 8, 12, ...
+        # Rank 1: processes row groups 1, 5, 9, 13, ...
+        # etc.
+        for batch in parquets_iter_batched("train", start=rank, step=world_size):
+            process(batch)
     """
     assert split in ["train", "val"], "split must be 'train' or 'val'"
     parquet_paths = list_parquet_files()

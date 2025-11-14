@@ -1,5 +1,44 @@
 """
-Evaluate compression ratio of the tokenizer.
+Tokenizer Compression Evaluation Script
+
+This script evaluates the compression ratio of the trained tokenizer by comparing
+it to GPT-2 and GPT-4 tokenizers on various types of text.
+
+Compression ratio = bytes / tokens
+Higher ratio means better compression (fewer tokens needed to represent the text).
+
+Test data includes:
+- News text: Recent news article with formal language
+- Korean text: Non-English text to test multilingual compression
+- Code text: Python code to test programming language compression
+- Math text: LaTeX mathematical text
+- Science text: Dense technical scientific writing
+- Training data: Text from the actual training distribution (FWE)
+
+The comparison helps answer questions like:
+- Does our tokenizer compress better than GPT-2/GPT-4?
+- How well does it handle different domains (code, math, non-English)?
+- Is the vocabulary size appropriate for our use case?
+
+The script prints colored comparison tables to the console:
+- Green = better compression
+- Red = worse compression
+- Relative diff % shows how much better/worse (positive = we're better)
+
+Usage:
+    python -m scripts.tok_eval
+
+The script will:
+1. Load our tokenizer and GPT-2/GPT-4 tokenizers
+2. Encode each test text with all tokenizers
+3. Calculate compression ratios (bytes per token)
+4. Print comparison tables
+5. Log results to experiment report
+
+Example output:
+    Comparison with GPT-2:
+    Text Type  Bytes  GPT-2 Tokens  Ours Tokens  Relative Diff %
+    news       1234   234 (5.27)    220 (5.61)   +6.0%  (Ours better)
 """
 
 from nanochat.tokenizer import get_tokenizer, RustBPETokenizer

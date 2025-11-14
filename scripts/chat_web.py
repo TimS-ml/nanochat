@@ -1,33 +1,64 @@
 #!/usr/bin/env python3
 """
-Unified web chat server - serves both UI and API from a single FastAPI instance.
+NanoChat Web Server
 
-Uses data parallelism to distribute requests across multiple GPUs. Each GPU loads
-a full copy of the model, and incoming requests are distributed to available workers.
+This script launches a FastAPI web server that serves both a chat UI and a streaming API
+for interacting with nanochat models. It supports multi-GPU deployment with automatic
+request distribution across GPUs using a worker pool pattern.
+
+Architecture:
+- FastAPI server handles HTTP requests
+- Worker pool maintains a queue of available GPU workers
+- Each worker has a full copy of the model on a dedicated GPU
+- Incoming requests acquire an available worker, generate response, release worker
+- This enables concurrent request handling across multiple GPUs
+
+Key features:
+- Beautiful web UI at / (served from nanochat/ui.html)
+- Streaming chat completions API at /chat/completions
+- Health check endpoint at /health
+- Worker statistics at /stats
+- Multi-GPU support with automatic load balancing
+- Abuse prevention (message length limits, parameter validation)
+- Proper UTF-8 handling for multi-byte characters (emojis, etc.)
+- Conversation logging to console
 
 Launch examples:
 
-- single available GPU (default)
-python -m scripts.chat_web
+Single GPU (default):
+    python -m scripts.chat_web
 
-- 4 GPUs
-python -m scripts.chat_web --num-gpus 4
+4 GPUs with load balancing:
+    python -m scripts.chat_web --num-gpus 4
 
-To chat, open the URL printed in the console. (If on cloud box, make sure to use public IP)
+Custom port and model:
+    python -m scripts.chat_web -i rl -p 8080
 
-Endpoints:
-  GET  /           - Chat UI
-  POST /chat/completions - Chat API (streaming only)
-  GET  /health     - Health check with worker pool status
-  GET  /stats      - Worker pool statistics and GPU utilization
+To chat, open the URL printed in console (e.g., http://localhost:8000)
+If on a cloud machine, use the public IP address instead of localhost.
+
+API Endpoints:
+
+GET /
+    Serves the interactive chat UI
+
+POST /chat/completions
+    Body: {"messages": [{"role": "user", "content": "Hello"}], "temperature": 0.8}
+    Returns: Server-sent events stream with tokens
+
+GET /health
+    Returns: {"status": "ok", "ready": true, "available_workers": N}
+
+GET /stats
+    Returns: Worker pool statistics and GPU assignments
 
 Abuse Prevention:
-  - Maximum 500 messages per request
-  - Maximum 8000 characters per message
-  - Maximum 32000 characters total conversation length
-  - Temperature clamped to 0.0-2.0
-  - Top-k clamped to 1-200
-  - Max tokens clamped to 1-4096
+- Maximum 500 messages per request
+- Maximum 8000 characters per message
+- Maximum 32000 characters total conversation length
+- Temperature clamped to 0.0-2.0
+- Top-k clamped to 1-200
+- Max tokens clamped to 1-4096
 """
 
 import argparse
@@ -96,7 +127,16 @@ class Worker:
     autocast_ctx: torch.amp.autocast
 
 class WorkerPool:
-    """Pool of workers, each with a model replica on a different GPU."""
+    """
+    Pool of workers for multi-GPU inference.
+
+    Each worker maintains a full copy of the model on a dedicated GPU.
+    Workers are stored in an async queue, and requests acquire/release workers
+    as needed. This enables concurrent request handling across multiple GPUs.
+
+    If a request arrives when all workers are busy, it will wait in the queue
+    until a worker becomes available.
+    """
 
     def __init__(self, num_gpus: Optional[int] = None):
         if num_gpus is None:
@@ -266,6 +306,25 @@ async def generate_stream(
     max_new_tokens=None,
     top_k=None
 ) -> AsyncGenerator[str, None]:
+    """
+    Generate assistant response with streaming.
+
+    This async generator yields tokens one at a time as they're generated,
+    enabling a smooth streaming experience in the UI. It handles multi-byte
+    UTF-8 characters (like emojis) correctly by accumulating tokens and only
+    yielding when a complete UTF-8 sequence is decoded.
+
+    Args:
+        worker: GPU worker to use for generation
+        tokens: List of prompt token IDs
+        temperature: Sampling temperature (None = use default)
+        max_new_tokens: Maximum tokens to generate (None = use default)
+        top_k: Top-k sampling parameter (None = use default)
+
+    Yields:
+        Server-sent event strings in format: "data: {json}\n\n"
+        Each event contains either a token or a done signal
+    """
     """Generate assistant response with streaming."""
     temperature = temperature if temperature is not None else args.temperature
     max_new_tokens = max_new_tokens if max_new_tokens is not None else args.max_tokens

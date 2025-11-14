@@ -1,14 +1,40 @@
 """
-Train model. Run as:
+Base Model Pretraining Script
 
-python base_train.py
+This script trains a GPT-style language model from scratch using the nanochat framework.
+It supports both single-GPU and distributed training across multiple GPUs using PyTorch DDP.
 
-or distributed as:
+Key features:
+- Configurable model architecture (depth-based scaling with aspect ratio 64)
+- Mixed optimizer training (Muon for weight matrices, AdamW for embeddings)
+- Gradient accumulation for large effective batch sizes
+- Learning rate warmup and warmdown scheduling
+- Checkpoint saving and resumption from previous steps
+- Periodic evaluation on validation set (bits per byte metric)
+- CORE benchmark evaluation for measuring model capabilities
+- Integration with Weights & Biases for experiment tracking
 
-torchrun --nproc_per_node=8 base_train.py
+Usage examples:
 
-If you are only on CPU/Macbook, you'll want to train a much much smaller LLM. Example:
-python -m scripts.base_train --depth=4 --max_seq_len=512 --device_batch_size=1 --eval_tokens=512 --core_metric_every=-1 --total_batch_size=512 --num_iterations=20
+Single GPU:
+    python base_train.py
+
+Distributed training on 8 GPUs:
+    torchrun --nproc_per_node=8 base_train.py
+
+CPU/Macbook (much smaller model required):
+    python -m scripts.base_train --depth=4 --max_seq_len=512 --device_batch_size=1 \
+        --eval_tokens=512 --core_metric_every=-1 --total_batch_size=512 --num_iterations=20
+
+Training horizon options (in order of precedence):
+    1. --num_iterations: Explicit number of optimization steps
+    2. --target_flops: Calculate steps to reach a specific FLOP budget
+    3. --target_param_data_ratio: Use Chinchilla-optimal ratio (default 20:1 tokens:params)
+
+Checkpoint resumption:
+    python -m scripts.base_train --resume_from_step=1000
+
+The script will automatically save checkpoints to base_checkpoints/<model_tag>/ directory.
 """
 
 import os
@@ -30,29 +56,36 @@ from scripts.base_eval import evaluate_model
 print_banner()
 
 # -----------------------------------------------------------------------------
-# User settings
+# User settings - these can be overridden via command line arguments or config file
+# The configurator.py script (executed below) allows CLI overrides for all these values
+
+# Experiment tracking
 run = "dummy" # wandb run name default ("dummy" is special - we won't log to wandb)
-# Runtime
+
+# Runtime configuration
 device_type = "" # cuda|cpu|mps (empty => autodetect good device type default, in order: CUDA > MPS > CPU)
-# Model architecture
+
+# Model architecture - derived from depth using fixed aspect ratios
 depth = 20 # the depth of the Transformer model to train, rest of the kwargs are derived
-max_seq_len = 2048 # max context length
-# Training horizon. Only one of these 3 will be used, in this order of precedence.
+max_seq_len = 2048 # max context length (number of tokens the model can attend to)
+
+# Training horizon. Only one of these 3 will be used, in this order of precedence:
+# 1. num_iterations (explicit steps) > 2. target_flops (FLOP budget) > 3. target_param_data_ratio (Chinchilla scaling)
 num_iterations = -1 # explicit number of steps of the optimization (-1 = disable)
 target_flops = -1.0 # calculate num_iterations to reach target_flops. Useful for scaling laws experiments (-1 = disable)
 target_param_data_ratio = 20 # calculate num_iterations to maintain fixed data:param ratio (Chinchilla=20) (-1 = disable)
-# Optimization
-device_batch_size = 32 # per-device batch size (set to not OOM)
-total_batch_size = 524288 # total desired batch size, in #tokens
-embedding_lr = 0.2 # learning rate for the embedding parameters (Adam)
-unembedding_lr = 0.004 # learning rate for the unembedding parameters (Adam)
-weight_decay = 0.0 # weight decay for the embedding/unembedding parameters (Adam)
-matrix_lr = 0.02 # learning rate for the matrix parameters (Muon)
-grad_clip = 1.0 # gradient clipping value (0.0 = disabled)
-warmup_ratio = 0.0 # ratio of iterations for LR warmup
-warmdown_ratio = 0.2 # ratio of iterations for LR warmdown
-final_lr_frac = 0.0 # final LR is this fraction of the initial LR
-resume_from_step = -1 # resume training from this step of the optimization (-1 = disable)
+# Optimization hyperparameters
+device_batch_size = 32 # per-device batch size (set to not OOM). Actual batch size per GPU.
+total_batch_size = 524288 # total desired batch size, in #tokens (across all GPUs and gradient accumulation)
+embedding_lr = 0.2 # learning rate for the embedding parameters (AdamW optimizer)
+unembedding_lr = 0.004 # learning rate for the unembedding parameters (AdamW optimizer)
+weight_decay = 0.0 # weight decay for the embedding/unembedding parameters (AdamW optimizer)
+matrix_lr = 0.02 # learning rate for the matrix parameters (Muon optimizer for weight matrices)
+grad_clip = 1.0 # gradient clipping value for norm clipping (0.0 = disabled)
+warmup_ratio = 0.0 # ratio of total iterations for learning rate warmup (linear ramp from 0 to max)
+warmdown_ratio = 0.2 # ratio of total iterations for learning rate warmdown (linear ramp to final_lr_frac)
+final_lr_frac = 0.0 # final LR is this fraction of the initial LR (0.0 = decay to zero)
+resume_from_step = -1 # resume training from this step of the optimization (-1 = disable, train from scratch)
 # Evaluation
 eval_every = 250 # every how many steps to evaluate the model for val bpb
 eval_tokens = 20*524288 # number of tokens to evaluate val loss on
@@ -176,20 +209,49 @@ x, y, dataloader_state_dict = next(train_loader) # kick off load of the very fir
 # -----------------------------------------------------------------------------
 # Set up hyperparameter schedulers
 
-# Learning rate scheduler
+# Learning rate scheduler - returns a multiplier to scale the base learning rate
 def get_lr_multiplier(it):
+    """
+    Calculate learning rate multiplier for the current iteration.
+
+    Implements a three-phase schedule:
+    1. Warmup: Linear ramp from 0 to 1.0 over warmup_iters steps
+    2. Stable: Hold at 1.0 for the middle portion of training
+    3. Warmdown: Linear decay from 1.0 to final_lr_frac over warmdown_iters steps
+
+    Args:
+        it: Current iteration number (0-indexed)
+
+    Returns:
+        Learning rate multiplier (float between 0 and 1)
+    """
     warmup_iters = round(warmup_ratio * num_iterations)
     warmdown_iters = round(warmdown_ratio * num_iterations)
     if it < warmup_iters:
+        # Warmup phase: linear ramp up
         return (it + 1) / warmup_iters
     elif it <= num_iterations - warmdown_iters:
+        # Stable phase: constant learning rate
         return 1.0
     else:
+        # Warmdown phase: linear decay to final_lr_frac
         progress = (num_iterations - it) / warmdown_iters
         return progress * 1.0 + (1 - progress) * final_lr_frac
 
 # Momentum scheduler for Muon optimizer
 def get_muon_momentum(it):
+    """
+    Calculate momentum value for Muon optimizer.
+
+    Ramps momentum from 0.85 to 0.95 over the first 300 iterations,
+    then holds at 0.95 for the rest of training.
+
+    Args:
+        it: Current iteration number
+
+    Returns:
+        Momentum value (float between 0.85 and 0.95)
+    """
     frac = min(it / 300, 1)
     momentum = (1 - frac) * 0.85 + frac * 0.95
     return momentum
@@ -211,9 +273,11 @@ else:
 
 # -----------------------------------------------------------------------------
 # Training loop
+# Note: The loop runs num_iterations+1 times (0 to num_iterations inclusive)
+# This allows us to perform final evaluation and checkpointing at step num_iterations
 while True:
-    last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
-    flops_so_far = num_flops_per_token * total_batch_size * step
+    last_step = step == num_iterations # True when we've completed all training iterations
+    flops_so_far = num_flops_per_token * total_batch_size * step # Total FLOPs used so far
 
     # once in a while: evaluate the val bpb (all ranks participate)
     if last_step or step % eval_every == 0:
@@ -299,36 +363,51 @@ while True:
         break
 
     # -------------------------------------------------------------------------
-    # single training step
-    # evaluate the gradient
+    # Single training step
+    # This implements gradient accumulation over multiple micro-batches to achieve
+    # the desired total_batch_size while staying within GPU memory limits
+
+    # Start timing the training step
     synchronize()
     t0 = time.time()
+
+    # Gradient accumulation loop - accumulate gradients over multiple micro-batches
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y)
-        train_loss = loss.detach() # for logging
-        loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
-        loss.backward()
-        x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
-    # gradient clipping
+            loss = model(x, y)  # Forward pass: compute loss on current batch
+        train_loss = loss.detach()  # Save loss for logging (detach to avoid keeping computation graph)
+        loss = loss / grad_accum_steps  # Normalize loss by number of accumulation steps (gradients sum)
+        loss.backward()  # Backward pass: accumulate gradients
+        x, y, dataloader_state_dict = next(train_loader)  # Prefetch next batch while GPU is busy
+
+    # Gradient clipping - helps stabilize training by preventing exploding gradients
     grad_clip_enabled = grad_clip > 0.0
     if grad_clip_enabled:
         grad_norm_tensor = torch.nn.utils.clip_grad_norm_(orig_model.parameters(), grad_clip)
-        grad_norm = grad_norm_tensor.item() # GPU tensor -> CPU float (note: cpu-gpu sync point)
-    # step the optimizers
+        grad_norm = grad_norm_tensor.item()  # Convert to Python float (note: this is a CPU-GPU sync point)
+
+    # Update learning rates according to schedule
     lrm = get_lr_multiplier(step)
     for opt in optimizers:
         for group in opt.param_groups:
             group["lr"] = group["initial_lr"] * lrm
+
+    # Update Muon momentum according to schedule
     muon_momentum = get_muon_momentum(step)
     for group in muon_optimizer.param_groups:
         group["momentum"] = muon_momentum
+
+    # Apply the accumulated gradients to update model parameters
     for opt in optimizers:
         opt.step()
+
+    # Clear gradients for next iteration (set_to_none=True is more memory efficient than zero_grad())
     model.zero_grad(set_to_none=True)
+
+    # Finish timing the training step
     synchronize()
     t1 = time.time()
-    dt = t1 - t0
+    dt = t1 - t0  # Time taken for this training step
     # -------------------------------------------------------------------------
 
     # logging
