@@ -1,6 +1,42 @@
 """
-Train a tokenizer using the HuggingFace Tokenizers library.
-In the style of GPT-4 tokenizer.
+Tokenizer Training Script
+
+This script trains a BPE (Byte Pair Encoding) tokenizer on the training data using
+the HuggingFace tokenizers library. The tokenizer is trained in the style of GPT-4's
+cl100k_base tokenizer.
+
+BPE tokenization:
+1. Start with all 256 possible bytes as the initial vocabulary
+2. Iteratively merge the most frequent pair of tokens to create new tokens
+3. Continue until reaching the target vocabulary size
+4. The result is a vocabulary that efficiently compresses common patterns
+
+The script also computes and caches token_bytes.pt, which maps each token ID to
+the number of bytes it represents. This enables efficient calculation of bits per
+byte (bpb) loss, which is invariant to vocabulary size.
+
+Key parameters:
+- vocab_size: Size of the final vocabulary (default 65536 = 2^16)
+- max_chars: Maximum characters to train on (default 10B)
+- doc_cap: Maximum characters per document (default 10K)
+
+The tokenizer will be saved to <base_dir>/tokenizer/ with:
+- tokenizer.json: Full tokenizer configuration
+- special_tokens.json: Special token definitions
+- token_bytes.pt: Tensor mapping token IDs to byte counts
+
+Usage examples:
+
+Default training (10B chars, vocab size 65536):
+    python -m scripts.tok_train
+
+Smaller vocabulary:
+    python -m scripts.tok_train --vocab_size=32768
+
+Train on less data (faster):
+    python -m scripts.tok_train --max_chars=1000000000  # 1B chars
+
+After training, use scripts.tok_eval to evaluate compression ratios.
 """
 import os
 import time
@@ -27,9 +63,21 @@ print(f"vocab_size: {args.vocab_size:,}")
 
 def text_iterator():
     """
-    1) Flatten the batches into a single iterator
-    2) Crop every document to args.doc_cap characters
-    3) Break when we've seen args.max_chars characters
+    Create an iterator over training text for tokenizer training.
+
+    This iterator:
+    1. Loads documents from the training data in batches
+    2. Crops each document to max doc_cap characters (prevents extremely long docs)
+    3. Yields documents one at a time
+    4. Stops after seeing max_chars total characters
+
+    Cropping long documents is important because:
+    - Very long documents can skew the token statistics
+    - Training is more balanced when each document has similar weight
+    - Speeds up training by limiting document size
+
+    Yields:
+        String documents from the training data
     """
     nchars = 0
     for batch in parquets_iter_batched(split="train"):

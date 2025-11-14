@@ -1,12 +1,36 @@
 """
-Midtrain the model. Same as pretraining but simpler.
-Run as:
+Midtraining Script
 
-python -m scripts.mid_train
+Midtraining is continued training of a pretrained base model on a curated mixture of tasks
+to improve performance on specific downstream capabilities. This is simpler than pretraining
+as it doesn't require checkpoint resumption logic (runs for one epoch typically).
 
-Or torchrun for training:
+The script loads a pretrained base model and continues training on a task mixture that includes:
+- SmolTalk: General conversational data
+- MMLU auxiliary train: Multiple choice knowledge questions
+- GSM8K: Math problems with calculator tool use
+- Identity conversations: Synthetic data for model identity
+- Spelling tasks: Simple spelling and character counting
 
-torchrun --standalone --nproc_per_node=8 -m scripts.mid_train -- --device_batch_size=16
+Key differences from base pretraining:
+- Loads from existing checkpoint instead of training from scratch
+- Uses a curated task mixture instead of raw web text
+- Typically runs for 1 epoch over the task data
+- Simpler training loop without resumption logic
+- Lower initial learning rate (init_lr_frac=1.0 by default)
+
+Usage examples:
+
+Single GPU:
+    python -m scripts.mid_train
+
+Distributed training on 8 GPUs:
+    torchrun --standalone --nproc_per_node=8 -m scripts.mid_train -- --device_batch_size=16
+
+Load specific checkpoint:
+    python -m scripts.mid_train --model_tag=d20 --step=10000
+
+The script saves the midtrained model to mid_checkpoints/<model_tag>/ directory.
 """
 
 from collections import deque
@@ -114,7 +138,26 @@ val_dataset = TaskMixture([
 # these two global variables and update them from within the data generator.
 last_step = False # we will toggle this to True when we reach the end of the dataset
 approx_progress = 0.0 # will go from 0 to 1 over the course of the epoch
+
 def mid_data_generator(split):
+    """
+    Generator that yields batches of tokenized conversation data for midtraining.
+
+    This generator handles:
+    - Iterating through the task mixture dataset
+    - Tokenizing conversations using the tokenizer
+    - Accumulating tokens into fixed-size batches
+    - Distributing work across multiple GPUs (each rank processes different docs)
+    - Tracking progress through the dataset
+
+    Args:
+        split: Either "train" or "val" to select the dataset split
+
+    Yields:
+        Tuple of (inputs, targets) where:
+        - inputs: Tensor of shape (device_batch_size, max_seq_len) with input token IDs
+        - targets: Tensor of shape (device_batch_size, max_seq_len) with target token IDs
+    """
     global last_step, approx_progress
     assert split in {"train", "val"}, "split must be 'train' or 'val'"
     dataset = train_dataset if split == "train" else val_dataset
@@ -161,6 +204,19 @@ progress = 0 # will go from 0 to 1 over the course of the epoch
 
 # Learning rate scheduler
 def get_lr_multiplier(progress):
+    """
+    Calculate learning rate multiplier based on progress through the dataset.
+
+    Uses a simple two-phase schedule:
+    - First 80% of training: constant LR (multiplier = 1.0)
+    - Last 20% of training: linear decay to 0
+
+    Args:
+        progress: Float between 0 and 1 indicating fraction of dataset completed
+
+    Returns:
+        Learning rate multiplier (1.0 for first 80%, then linearly decreasing to 0)
+    """
     # first 80% of training: no decay, then linearly ramp down to 0.
     return 1 if progress < 0.8 else 1 - (progress - 0.8) / 0.2
 

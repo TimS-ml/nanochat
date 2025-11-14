@@ -1,5 +1,22 @@
 """
-Utilities for saving and loading model/optim/state checkpoints.
+Checkpoint Manager - Utilities for saving and loading model/optimizer/metadata checkpoints.
+
+This module provides:
+- Checkpoint saving: persisting model weights, optimizer states, and metadata
+- Checkpoint loading: restoring training state from saved checkpoints
+- Directory management: organizing checkpoints by model size and training phase
+- Automatic model discovery: finding the latest or largest checkpoint
+
+Checkpoints are organized as:
+- model_<step>.pt: Model state dict (rank 0 only)
+- meta_<step>.json: Training metadata and config (rank 0 only)
+- optim_<step>_rank<N>.pt: Optimizer state (per-rank, for distributed training)
+
+Supports different training phases:
+- base: Pre-training checkpoints
+- mid: Mid-training (domain adaptation) checkpoints
+- sft: Supervised fine-tuning checkpoints
+- rl: Reinforcement learning checkpoints
 """
 import os
 import re
@@ -17,10 +34,27 @@ from nanochat.common import setup_default_logging
 setup_default_logging()
 logger = logging.getLogger(__name__)
 def log0(message):
+    """Log message only from rank 0 (main process in distributed training)."""
     if int(os.environ.get('RANK', 0)) == 0:
         logger.info(message)
 
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
+    """
+    Save a training checkpoint to disk.
+
+    Args:
+        checkpoint_dir: Directory to save checkpoint files
+        step: Training step number (used in filenames)
+        model_data: Model state dict (only saved by rank 0)
+        optimizer_data: Optimizer state dict (saved by each rank separately for ZeRO-2)
+        meta_data: Metadata dictionary (config, hyperparams, etc.) - saved as JSON
+        rank: Process rank in distributed training (default: 0)
+
+    Creates three types of files:
+    - model_<step>.pt: Model weights (rank 0 only)
+    - meta_<step>.json: Training metadata (rank 0 only)
+    - optim_<step>_rank<N>.pt: Optimizer state (per-rank)
+    """
     if rank == 0:
         os.makedirs(checkpoint_dir, exist_ok=True)
         # Save the model state parameters
@@ -39,6 +73,22 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
         logger.info(f"Saved optimizer state to: {optimizer_path}")
 
 def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
+    """
+    Load a training checkpoint from disk.
+
+    Args:
+        checkpoint_dir: Directory containing checkpoint files
+        step: Training step number to load
+        device: Device to load tensors onto
+        load_optimizer: Whether to load optimizer state (default: False)
+        rank: Process rank for loading rank-specific optimizer state
+
+    Returns:
+        Tuple of (model_data, optimizer_data, meta_data)
+        - model_data: Model state dict
+        - optimizer_data: Optimizer state dict (None if load_optimizer=False)
+        - meta_data: Metadata dictionary
+    """
     # Load the model state
     model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
     model_data = torch.load(model_path, map_location=device)

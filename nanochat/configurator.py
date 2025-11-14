@@ -1,17 +1,30 @@
 """
-Poor Man's Configurator. Probably a terrible idea. Example usage:
-$ python train.py config/override_file.py --batch_size=32
-this will first run config/override_file.py, then override batch_size to 32
+Poor Man's Configurator - Simple command-line configuration override system.
 
-The code in this file will be run as follows from e.g. train.py:
->>> exec(open('configurator.py').read())
+This is intentionally simple but unconventional. It allows config overrides via:
+1. Config files: python train.py config/my_config.py
+2. CLI arguments: python train.py --batch_size=32
+3. Both: python train.py config/my_config.py --batch_size=32
 
-So it's not a Python module, it's just shuttling this code away from train.py
-The code in this script then overrides the globals()
+How it works:
+- This file is exec()'d from training scripts (e.g., train.py)
+- Not imported as a module, just runs as inline code
+- Directly modifies globals() in the calling script
+- Config files are also exec()'d, allowing Python expressions
 
-I know people are not going to love this, I just really dislike configuration
-complexity and having to prepend config. to every single variable. If someone
-comes up with a better simple Python solution I am all ears.
+Pros:
+- Very simple, no config. prefix needed
+- Full Python expressiveness in config files
+- Type checking ensures overrides match defaults
+
+Cons:
+- Uses exec() which some consider unsafe/unpythonic
+- Not a conventional config system
+
+Example usage:
+    $ python train.py config/small_model.py --learning_rate=0.001
+
+If you have a better simple solution, contributions welcome!
 """
 
 import os
@@ -23,33 +36,35 @@ def print0(s="",**kwargs):
     if ddp_rank == 0:
         print(s, **kwargs)
 
+# Parse command-line arguments and apply configuration overrides
 for arg in sys.argv[1:]:
     if '=' not in arg:
-        # assume it's the name of a config file
-        assert not arg.startswith('--')
+        # No '=' sign means this is a config file path
+        assert not arg.startswith('--'), "File paths should not start with --"
         config_file = arg
         print0(f"Overriding config with {config_file}:")
         with open(config_file) as f:
             print0(f.read())
+        # Execute the config file, which sets variables in globals()
         exec(open(config_file).read())
     else:
-        # assume it's a --key=value argument
-        assert arg.startswith('--')
+        # Has '=' sign means this is a --key=value override
+        assert arg.startswith('--'), "Key-value overrides must start with --"
         key, val = arg.split('=')
-        key = key[2:]
+        key = key[2:]  # Strip the '--' prefix
         if key in globals():
             try:
-                # attempt to eval it it (e.g. if bool, number, or etc)
+                # Try to parse as a Python literal (int, float, bool, list, etc.)
                 attempt = literal_eval(val)
             except (SyntaxError, ValueError):
-                # if that goes wrong, just use the string
+                # If parsing fails, treat as a string
                 attempt = val
-            # ensure the types match ok
+            # Type safety: ensure override matches the type of the default value
             if globals()[key] is not None:
                 attempt_type = type(attempt)
                 default_type = type(globals()[key])
-                assert attempt_type == default_type, f"Type mismatch: {attempt_type} != {default_type}"
-            # cross fingers
+                assert attempt_type == default_type, f"Type mismatch for {key}: {attempt_type} != {default_type}"
+            # Apply the override
             print0(f"Overriding: {key} = {attempt}")
             globals()[key] = attempt
         else:

@@ -1,13 +1,44 @@
 """
-Evaluate the CORE metric for a given model.
+Base Model Evaluation Script - CORE Benchmark
 
-Run on a single GPU:
-python -m scripts.base_eval
+This script evaluates a pretrained base language model on the CORE (Common-sense Reasoning Evaluation)
+benchmark, which measures the model's performance across a diverse set of reasoning tasks.
 
-Run with torchrun on e.g. 8 GPUs:
-torchrun --nproc_per_node=8 -m scripts.base_eval
+The CORE metric is calculated as:
+1. Run the model on each task in the benchmark
+2. Calculate raw accuracy for each task
+3. Center each accuracy by its random baseline: (acc - baseline) / (1 - baseline)
+4. Average the centered accuracies to get the final CORE metric
 
-The script will print the CORE metric to the console.
+The centered metric ranges from 0 (random performance) to 1 (perfect performance), making it
+easier to compare models of different sizes and architectures.
+
+The benchmark includes tasks like:
+- Multiple choice question answering (e.g., ARC, HellaSwag)
+- Reading comprehension
+- Common-sense reasoning
+- Basic knowledge and facts
+
+Usage examples:
+
+Single GPU evaluation:
+    python -m scripts.base_eval
+
+Multi-GPU distributed evaluation (faster):
+    torchrun --nproc_per_node=8 -m scripts.base_eval
+
+Evaluate a HuggingFace model:
+    python -m scripts.base_eval --hf-path=openai-community/gpt2
+
+Quick test with limited examples:
+    python -m scripts.base_eval --max-per-task=100
+
+The script will:
+1. Download the evaluation bundle (~162MB) if not already cached
+2. Load the model and tokenizer
+3. Run evaluation on all CORE tasks
+4. Print results to console and save to base_eval/<model_slug>.csv
+5. Log results to the experiment report
 """
 import os
 import csv
@@ -48,7 +79,22 @@ def place_eval_bundle(file_path):
 def evaluate_model(model, tokenizer, device, max_per_task=-1):
     """
     Evaluate a base model on the CORE benchmark.
-    - max_per_task: crop the data to this many examples per task for testing (-1 = disable)
+
+    This function runs the model on all tasks in the CORE benchmark and computes
+    the centered accuracies relative to random baselines.
+
+    Args:
+        model: The language model to evaluate (must support __call__ with input_ids)
+        tokenizer: Tokenizer for encoding/decoding text
+        device: PyTorch device to run evaluation on (cuda/cpu/mps)
+        max_per_task: Maximum number of examples per task to evaluate (-1 = use all data)
+                      Useful for quick testing or debugging
+
+    Returns:
+        Dictionary containing:
+        - 'results': Raw accuracy for each task
+        - 'centered_results': Centered accuracy (normalized by random baseline) for each task
+        - 'core_metric': Average of all centered accuracies (the main metric)
     """
     # Load config and task metadata
     base_dir = get_base_dir()

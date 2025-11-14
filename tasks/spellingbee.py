@@ -36,16 +36,26 @@ LETTERS = "abcdefghijklmnopqrstuvwxyz"
 # A list of 370K English words of large variety
 WORD_LIST_URL = "https://raw.githubusercontent.com/dwyl/english-words/refs/heads/master/words_alpha.txt"
 
-# Identical to gsm8k's answer extraction
+# Regex pattern to extract final answer after #### marker (identical to GSM8K)
 ANSWER_RE = re.compile(r"#### (\-?[0-9\.\,]+)")
+
 def extract_answer(completion):
     """
-    Extract the numerical answer after #### marker.
+    Extract the numerical answer after the #### marker.
+
+    Args:
+        completion: Text containing a solution with #### marker
+
+    Returns:
+        str: Normalized numeric string, or None if no answer found
+
+    This is identical to GSM8K's answer extraction - we use the same format
+    for consistency across math-style tasks.
     """
     match = ANSWER_RE.search(completion)
     if match:
         match_str = match.group(1).strip()
-        match_str = match_str.replace(",", "")
+        match_str = match_str.replace(",", "")  # Normalize: remove commas
         return match_str
     return None
 
@@ -111,54 +121,125 @@ USER_MSG_TEMPLATES = [
 ]
 
 class SpellingBee(Task):
+    """
+    SpellingBee: Counting letter occurrences in words.
+
+    This task teaches models to count how many times a specific letter appears
+    in a word. It's designed to improve small models' spelling and character-level
+    reasoning by combining manual counting with Python verification.
+
+    The task is challenging for LLMs because:
+    - Models see words as tokens (semantic chunks), not character sequences
+    - Requires understanding how tokens decompose into individual characters
+    - Small models often struggle with this without explicit training
+
+    Example problem:
+        Q: How many 'r' are in the word 'strawberry'?
+        A: Manual spelling + counting + Python verification -> #### 3
+    """
 
     def __init__(self, size=1000, split="train", **kwargs):
+        """
+        Initialize the SpellingBee task with synthetic problems.
+
+        Args:
+            size: Number of synthetic problems to generate
+            split: Either "train" or "test" (uses different random seeds)
+            **kwargs: Additional arguments passed to parent Task
+
+        The task generates problems on-the-fly from a large word list (~370K words).
+        Different splits use different random seeds to ensure no overlap.
+        """
         super().__init__(**kwargs)
         assert split in ["train", "test"], "SpellingBee split must be train|test"
         self.size = size
         self.split = split
+
+        # Download the English word list if not already cached
         filename = WORD_LIST_URL.split("/")[-1]
         word_list_path = download_file_with_lock(WORD_LIST_URL, filename)
+
+        # Load all words from the file
         with open(word_list_path, 'r', encoding='utf-8') as f:
             words = [line.strip() for line in f]
-        self.words = words
+        self.words = words  # ~370K English words
 
     @property
     def eval_type(self):
+        """SpellingBee is a generative task with numeric answers."""
         return 'generative'
 
     def num_examples(self):
+        """Returns the configured size (number of synthetic problems)."""
         return self.size
 
     def get_example(self, index):
-        seed = index if self.split == "train" else -(index + 1) # avoid collision at 0
+        """
+        Generate a synthetic letter-counting problem.
+
+        Args:
+            index: Index determining which problem to generate
+
+        Returns:
+            dict: Conversation with step-by-step solution using tool calls
+
+        The problem is generated deterministically from the index using a random seed.
+        This ensures reproducibility while creating diverse problems across the dataset.
+        Train and test splits use different seeds to avoid overlap.
+        """
+        # Use index as random seed, but negate for test split to avoid overlap
+        # This ensures train[0] != test[0] even though both use index 0
+        seed = index if self.split == "train" else -(index + 1)
         rng = random.Random(seed)
 
-        # pick a random word
+        # Pick a random word from the word list
         word = rng.choice(self.words)
-        # pick a letter from it (90%) or a random letter (10%)
+
+        # Pick a letter to count:
+        # - 90% of the time: pick a letter from the word (ensures non-zero counts are common)
+        # - 10% of the time: pick a random letter (allows for zero counts)
+        # This distribution makes the task more interesting than always picking present letters
         letter = rng.choice(word) if rng.random() < 0.9 else rng.choice(LETTERS)
 
-        # get the correct answer by simply counting
+        # Compute the correct answer by counting occurrences
         count = word.count(letter)
 
-        # create a user message, with a bunch of variations as data augmentation
+        # Create user message with heavy data augmentation for robustness
+        # We want the model to work with diverse phrasings and formatting
+
+        # Choose a random template from 30+ variations across multiple languages
         template = rng.choice(USER_MSG_TEMPLATES)
-        # 30% chance to lowercase the template (lazy people don't use shift)
+
+        # 30% chance to lowercase the entire template
+        # Simulates casual users who don't capitalize
         if rng.random() < 0.3:
             template = template.lower()
+
+        # Randomly decide whether to quote the letter and word
+        # This creates variety: 'r' in strawberry, r in "strawberry", etc.
         quote_options = ['', "'", '"']
-        letter_quote = rng.choice(quote_options) # is the letter quoted?
-        word_quote = rng.choice(quote_options) # is the word quoted?
+        letter_quote = rng.choice(quote_options)
+        word_quote = rng.choice(quote_options)
         letter_wrapped = f"{letter_quote}{letter}{letter_quote}"
         word_wrapped = f"{word_quote}{word}{word_quote}"
+
+        # Fill in the template with the wrapped letter and word
         user_msg = template.format(letter=letter_wrapped, word=word_wrapped)
-        if rng.random() < 0.5: # 50% of people don't even use question marks
+
+        # 50% chance to add a question mark at the end
+        # Many users forget punctuation, so we want robustness to both
+        if rng.random() < 0.5:
             user_msg += "?"
 
-        # Now create the ideal assistant response - build as parts (text + tool calls)
+        # Build the ideal assistant response as a list of parts
+        # The solution demonstrates a two-phase approach:
+        # 1. Manual character-by-character counting (shows reasoning)
+        # 2. Python verification (teaches tool usage)
         assistant_parts = []
-        word_letters = ",".join(list(word))
+
+        # Phase 1: Manual counting with detailed work shown
+        word_letters = ",".join(list(word))  # e.g., "s,t,r,a,w,b,e,r,r,y"
+
         manual_text = f"""We are asked to find the number '{letter}' in the word '{word}'. Let me try a manual approach first.
 
 First spell the word out:
@@ -166,30 +247,42 @@ First spell the word out:
 
 Then count the occurrences of '{letter}':
 """
-        # Little simulated loop of the solution process
-        # TODO: This is where the fun starts, we could simulate cute little mistakes
-        # and get the model to review its work and recover from them.
-        # You might of course hope this could arise in RL too, but realistically you'd want to help it out a bit.
+
+        # Simulate the counting process step by step
+        # This teaches the model to:
+        # - Spell words character by character
+        # - Track a running count
+        # - Show their work
+        #
+        # TODO: Future enhancement - occasionally introduce small mistakes that the
+        # model catches and corrects. This would teach error recovery, which could
+        # also emerge from RL but would benefit from explicit supervision.
         running_count = 0
         for i, char in enumerate(word, 1):
             if char == letter:
                 running_count += 1
-                # note: there deliberately cannot be a space here between i and char
-                # because this would create a different token! (e.g. " a" and "a" are different tokens)
+                # CRITICAL: No space between i and char (f"{i}:{char}")
+                # This is because " a" and "a" are different tokens!
+                # We want "a" to appear as a single token both here and in the word
                 manual_text += f"{i}:{char} hit! count={running_count}\n"
             else:
                 manual_text += f"{i}:{char}\n"
 
         manual_text += f"\nThis gives us {running_count}."
         assistant_parts.append({"type": "text", "text": manual_text})
-        # Part 2: Python verification
+
+        # Phase 2: Python verification
+        # This teaches the model to verify manual work with code
         assistant_parts.append({"type": "text", "text": "\n\nLet me double check this using Python:\n\n"})
-        # Part 3: Python tool call
+
+        # Python tool call: word.count(letter)
         python_expr = f"'{word}'.count('{letter}')"
         assistant_parts.append({"type": "python", "text": python_expr})
-        # Part 4: Python output
+
+        # Python output: the actual count
         assistant_parts.append({"type": "python_output", "text": str(count)})
-        # Part 5: Final answer
+
+        # Final answer in standard #### format (like GSM8K)
         assistant_parts.append({"type": "text", "text": f"\n\nPython gives us {count}.\n\nMy final answer is:\n\n#### {count}"})
 
         # return the full conversation
@@ -229,39 +322,92 @@ Then count the occurrences of '{letter}':
 
 
 class SimpleSpelling(Task):
-    """Much simpler task designed to get the model to just practice spelling words."""
+    """
+    SimpleSpelling: Basic word spelling practice.
+
+    A condensed version of SpellingBee focused purely on spelling words
+    letter-by-letter, without the counting component. This task isolates
+    the core challenge that makes SpellingBee difficult for small models.
+
+    Why this task exists:
+    - LLMs see text as tokens (semantic chunks), not character sequences
+    - Small models need explicit training to map tokens -> character sequences
+    - This provides focused practice on the spelling skill
+    - Larger models learn this naturally, but small models benefit from explicit examples
+
+    Example:
+        Q: Spell the word: strawberry
+        A: strawberry:s,t,r,a,w,b,e,r,r,y
+
+    This is particularly useful for:
+    - Midtraining phase (augmenting base knowledge)
+    - Small models (< 1B parameters)
+    - Tasks requiring character-level understanding
+    """
 
     def __init__(self, size=1000, split="train", **kwargs):
+        """
+        Initialize the SimpleSpelling task.
+
+        Args:
+            size: Number of synthetic spelling problems to generate
+            split: Either "train" or "test"
+            **kwargs: Additional arguments passed to parent Task
+        """
         super().__init__(**kwargs)
         assert split in ["train", "test"], "SpellingBee split must be train|test"
         self.size = size
         self.split = split
+
+        # Load the same word list as SpellingBee
         filename = WORD_LIST_URL.split("/")[-1]
         word_list_path = download_file_with_lock(WORD_LIST_URL, filename)
         with open(word_list_path, 'r', encoding='utf-8') as f:
             words = [line.strip() for line in f]
+
+        # Shuffle the word list with a fixed seed
+        # This gives us a different word order than SpellingBee, ensuring variety
         rng = random.Random(42)
-        rng.shuffle(words) # use a different word order than the SpellingBee task
+        rng.shuffle(words)
         self.words = words
 
     @property
     def eval_type(self):
+        """SimpleSpelling is a generative task."""
         return 'generative'
 
     def num_examples(self):
+        """Returns the configured size (number of problems)."""
         return self.size
 
     def get_example(self, index):
-        seed = index if self.split == "train" else -(index + 1) # avoid collision at 0
+        """
+        Generate a simple spelling problem.
+
+        Args:
+            index: Index determining which word to spell
+
+        Returns:
+            dict: Conversation with user request and assistant spelling
+
+        Format: "word:l,e,t,t,e,r,s" (word followed by comma-separated characters)
+        """
+        # Use index as random seed (different seeds for train vs test)
+        seed = index if self.split == "train" else -(index + 1)
         rng = random.Random(seed)
-        # pick a random word
+
+        # Pick a random word to spell
         word = rng.choice(self.words)
+
+        # Format as comma-separated letters
         word_letters = ",".join(list(word))
-        # return the full conversation
+
+        # Build the simple conversation
         messages = [
             {"role": "user", "content": f"Spell the word: {word}"},
             {"role": "assistant", "content": f"{word}:{word_letters}"}
         ]
+
         conversation = {
             "messages": messages,
         }

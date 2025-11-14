@@ -1,19 +1,40 @@
 """
-Reinforcement learning on GSM8K via "GRPO".
+Chat Model Reinforcement Learning (RL) Script
 
-I put GRPO in quotes because we actually end up with something a lot
-simpler and more similar to just REINFORCE:
+This script applies reinforcement learning to a chat model to improve its performance
+on GSM8K math problems. The approach is similar to GRPO (Group Relative Policy Optimization)
+but simplified to a variant of REINFORCE with several modifications:
 
-1) Delete trust region, so there is no KL regularization to a reference model
-2) We are on policy, so there's no need for PPO ratio+clip.
-3) We use GAPO style normalization that is token-level, not sequence-level.
-4) Instead of z-score normalization (r - mu)/sigma, only use (r - mu) as the advantage.
+Key RL design decisions:
+1. No trust region: No KL regularization to a reference model (simpler, more aggressive)
+2. On-policy: Generate fresh samples each step, so no need for PPO ratio clipping
+3. Token-level advantages: Use (r - mu) normalization instead of z-score (r - mu) / sigma
+4. Reward-weighted gradients: Maximize log-probability weighted by centered rewards
 
-1 GPU:
-python -m scripts.chat_rl
+Training procedure:
+1. Sample K completions for each problem using the current policy
+2. Execute code to calculate rewards (1.0 for correct, 0.0 for incorrect)
+3. Calculate advantages by centering rewards (r - mean(r))
+4. Compute policy gradient: ∇_θ Σ log π_θ(a|s) * advantage
+5. Update model parameters to increase probability of high-reward completions
 
-8 GPUs:
-torchrun --standalone --nproc_per_node=8 -m scripts.chat_rl -- --run=default
+The model learns to:
+- Generate syntactically correct Python code for calculator use
+- Solve multi-step math problems
+- Improve pass@k performance (probability at least 1 of k samples is correct)
+
+Usage examples:
+
+Single GPU:
+    python -m scripts.chat_rl
+
+8 GPUs distributed training:
+    torchrun --standalone --nproc_per_node=8 -m scripts.chat_rl -- --run=default
+
+Custom RL hyperparameters:
+    python -m scripts.chat_rl --num_samples=32 --temperature=1.2 --examples_per_step=32
+
+The script saves RL checkpoints to chatrl_checkpoints/<model_tag>/ directory.
 """
 
 import os
@@ -77,6 +98,27 @@ print0(f"Calculated number of steps: {num_steps}")
 
 @torch.no_grad()
 def get_batch():
+    """
+    Generate a batch of rollouts for RL training.
+
+    This is the core of the RL training loop. For each training example:
+    1. Load the conversation (user message + expected assistant response)
+    2. Truncate to just the prompt (delete assistant's answer)
+    3. Sample K completions from the current policy
+    4. Calculate rewards by checking if answers are correct
+    5. Prepare training data (inputs, targets, rewards, advantages)
+
+    The function is a generator that yields one example at a time (with K samples per example).
+    Each rank processes different examples to enable distributed RL training.
+
+    Yields:
+        Tuple of:
+        - generated_token_sequences: List of K token sequences (including prompt)
+        - inputs: Tensor of shape (K, T) with input tokens for training
+        - targets: Tensor of shape (K, T) with target tokens (masked where not supervised)
+        - rewards: Tensor of shape (K,) with rewards (1.0 or 0.0)
+        - advantages: Tensor of shape (K,) with centered rewards (r - mean(r))
+    """
     assistant_end = tokenizer.encode_special("<|assistant_end|>") # ok to use this token, it's only for padding and isn't used in the loss.
     rank_indices = range(ddp_rank, len(train_task), ddp_world_size) # each rank is responsible for different examples in the training data
     for example_idx in itertools.cycle(rank_indices):

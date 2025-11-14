@@ -1,8 +1,39 @@
 """
-New and upgraded chat mode because a lot of the code has changed since the last one.
+Interactive Chat CLI
 
-Intended to be run single GPU only atm:
-python -m scripts.chat_cli -i mid
+This script provides a command-line interface for chatting with nanochat models.
+It supports both interactive multi-turn conversations and single-shot prompts.
+
+Features:
+- Multi-turn conversations with full history
+- Streaming token-by-token generation (shows tokens as they're generated)
+- Special commands: 'quit'/'exit' to end, 'clear' to reset conversation
+- Configurable generation parameters (temperature, top-k)
+- Can load models from different training stages (mid, sft, rl)
+
+The conversation uses special tokens to structure the dialogue:
+- <|bos|>: Beginning of conversation
+- <|user_start|>...<|user_end|>: User message
+- <|assistant_start|>...<|assistant_end|>: Assistant message
+
+Usage examples:
+
+Interactive chat with SFT model:
+    python -m scripts.chat_cli -i sft
+
+Interactive chat with RL model:
+    python -m scripts.chat_cli -i rl
+
+Single prompt (no interaction):
+    python -m scripts.chat_cli -i sft -p "What is the capital of France?"
+
+Custom generation settings:
+    python -m scripts.chat_cli -i sft -t 0.8 -k 100
+
+Load specific checkpoint:
+    python -m scripts.chat_cli -i mid -g d20 -s 5000
+
+The CLI will print each token as it's generated, providing a smooth interactive experience.
 """
 import argparse
 import torch

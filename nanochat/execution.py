@@ -36,7 +36,17 @@ from typing import Optional
 
 @dataclass
 class ExecutionResult:
-    """Result of executing Python code in a sandbox."""
+    """
+    Result of executing Python code in a sandbox.
+
+    Attributes:
+        success: True if code executed without errors, False otherwise
+        stdout: Captured standard output from the code execution
+        stderr: Captured standard error from the code execution
+        error: Error message if execution failed (None if successful)
+        timeout: True if execution exceeded time limit
+        memory_exceeded: True if execution exceeded memory limit
+    """
     success: bool
     stdout: str
     stderr: str
@@ -45,6 +55,10 @@ class ExecutionResult:
     memory_exceeded: bool = False
 
     def __repr__(self):
+        """
+        Custom string representation that only shows non-empty/non-default fields.
+        Makes the output more readable by omitting unnecessary information.
+        """
         parts = []
         parts.append(f"ExecutionResult(success={self.success}")
         if self.timeout:
@@ -63,23 +77,54 @@ class ExecutionResult:
 
 @contextlib.contextmanager
 def time_limit(seconds: float):
+    """
+    Context manager to enforce a time limit on code execution using signals.
+
+    Args:
+        seconds: Maximum execution time in seconds (can be fractional)
+
+    Raises:
+        TimeoutException: If execution time exceeds the limit
+
+    Note:
+        Uses SIGALRM which only works on Unix-like systems (not Windows).
+        The timer is automatically cleared on exit even if an exception occurs.
+    """
     def signal_handler(signum, frame):
+        """Signal handler that raises TimeoutException when alarm fires."""
         raise TimeoutException("Timed out!")
 
+    # Set up a real-time interval timer that fires after 'seconds'
     signal.setitimer(signal.ITIMER_REAL, seconds)
     signal.signal(signal.SIGALRM, signal_handler)
     try:
         yield
     finally:
+        # Clear the timer to prevent it from firing after we exit the context
         signal.setitimer(signal.ITIMER_REAL, 0)
 
 
 @contextlib.contextmanager
 def capture_io():
-    """Capture stdout and stderr, and disable stdin."""
+    """
+    Capture stdout and stderr, and disable stdin for untrusted code execution.
+
+    This prevents code from:
+    - Reading from stdin (raises IOError)
+    - Printing to the terminal directly (captured instead)
+
+    Yields:
+        Tuple of (stdout_capture, stderr_capture): StringIO objects containing output
+
+    Example:
+        with capture_io() as (stdout, stderr):
+            print("hello")  # Captured, not printed to terminal
+            input()  # Raises IOError
+        output = stdout.getvalue()  # "hello\n"
+    """
     stdout_capture = io.StringIO()
     stderr_capture = io.StringIO()
-    stdin_block = WriteOnlyStringIO()
+    stdin_block = WriteOnlyStringIO()  # Prevents reading from stdin
     with contextlib.redirect_stdout(stdout_capture):
         with contextlib.redirect_stderr(stderr_capture):
             with redirect_stdin(stdin_block):
@@ -88,38 +133,75 @@ def capture_io():
 
 @contextlib.contextmanager
 def create_tempdir():
+    """
+    Create a temporary directory and change to it for the duration of the context.
+
+    The directory is automatically deleted when exiting the context, along with
+    all files created inside it. This provides isolation for file operations.
+
+    Yields:
+        str: Path to the temporary directory
+    """
     with tempfile.TemporaryDirectory() as dirname:
         with chdir(dirname):
             yield dirname
 
 
 class TimeoutException(Exception):
+    """Exception raised when code execution exceeds the time limit."""
     pass
 
 
 class WriteOnlyStringIO(io.StringIO):
-    """StringIO that throws an exception when it's read from"""
+    """
+    StringIO subclass that raises IOError on any read operation.
+
+    This is used to block stdin access in untrusted code execution,
+    preventing code from waiting for user input (which would hang).
+    """
 
     def read(self, *args, **kwargs):
+        """Raise IOError instead of reading."""
         raise IOError
 
     def readline(self, *args, **kwargs):
+        """Raise IOError instead of reading a line."""
         raise IOError
 
     def readlines(self, *args, **kwargs):
+        """Raise IOError instead of reading all lines."""
         raise IOError
 
     def readable(self, *args, **kwargs):
-        """Returns True if the IO object can be read."""
+        """
+        Returns False to indicate this stream cannot be read from.
+
+        Returns:
+            bool: Always False
+        """
         return False
 
 
 class redirect_stdin(contextlib._RedirectStream):  # type: ignore
+    """
+    Context manager to redirect stdin, similar to redirect_stdout/redirect_stderr.
+
+    This is not provided by the standard library but follows the same pattern.
+    """
     _stream = "stdin"
 
 
 @contextlib.contextmanager
 def chdir(root):
+    """
+    Temporarily change to a different directory.
+
+    Args:
+        root: Directory to change to ("." to stay in current directory)
+
+    Note:
+        The original directory is restored even if an exception occurs.
+    """
     if root == ".":
         yield
         return
@@ -128,94 +210,139 @@ def chdir(root):
     try:
         yield
     finally:
+        # Always restore the original directory
         os.chdir(cwd)
 
 
 def reliability_guard(maximum_memory_bytes: Optional[int] = None):
     """
-    This disables various destructive functions and prevents the generated code
-    from interfering with the test (e.g. fork bomb, killing other processes,
-    removing filesystem files, etc.)
+    Disable destructive functions to protect against accidental or malicious code.
 
-    WARNING
-    This function is NOT a security sandbox. Untrusted code, including, model-
-    generated code, should not be blindly executed outside of one. See the
-    Codex paper for more information about OpenAI's code sandbox, and proceed
-    with caution.
+    This function neuters potentially dangerous operations like:
+    - File system modifications (remove, rename, chmod, etc.)
+    - Process management (fork, kill, system, subprocess)
+    - Resource manipulation (setuid, chroot, etc.)
+    - Memory-intensive operations (enforces memory limits)
+
+    Args:
+        maximum_memory_bytes: Maximum memory usage in bytes (None to skip)
+
+    WARNING:
+        This function is NOT a security sandbox. Untrusted code, including model-
+        generated code, should not be blindly executed outside of a proper sandbox.
+        See the Codex paper for more information about OpenAI's code sandbox.
+
+    Note:
+        - Memory limits only work on non-macOS systems
+        - This provides defense-in-depth against accidental issues, not security
+        - Sophisticated attackers could still bypass these restrictions
     """
 
+    # Set memory limits (doesn't work reliably on macOS)
     if platform.uname().system != "Darwin":
-        # These resource limit calls seem to fail on macOS (Darwin), skip?
         import resource
+        # RLIMIT_AS: maximum area (in bytes) of address space
         resource.setrlimit(resource.RLIMIT_AS, (maximum_memory_bytes, maximum_memory_bytes))
+        # RLIMIT_DATA: maximum size of the process's data segment
         resource.setrlimit(resource.RLIMIT_DATA, (maximum_memory_bytes, maximum_memory_bytes))
+        # RLIMIT_STACK: maximum size of the process stack
         resource.setrlimit(resource.RLIMIT_STACK, (maximum_memory_bytes, maximum_memory_bytes))
 
+    # Disable fault handler to prevent it from interfering with our error handling
     faulthandler.disable()
 
+    # Disable built-in exit functions
     import builtins
-
     builtins.exit = None
     builtins.quit = None
 
     import os
 
+    # Limit OpenMP to single thread to reduce resource usage
     os.environ["OMP_NUM_THREADS"] = "1"
 
+    # Disable process management functions (prevent fork bombs, process killing)
     os.kill = None
     os.system = None
     os.putenv = None
-    os.remove = None
-    os.removedirs = None
-    os.rmdir = None
-    os.fchdir = None
-    os.setuid = None
     os.fork = None
     os.forkpty = None
     os.killpg = None
+    os.setuid = None
+
+    # Disable file system modification functions (prevent file deletion/modification)
+    os.remove = None
+    os.removedirs = None
+    os.rmdir = None
     os.rename = None
     os.renames = None
     os.truncate = None
     os.replace = None
     os.unlink = None
+
+    # Disable file permission modification functions
     os.fchmod = None
     os.fchown = None
     os.chmod = None
     os.chown = None
-    os.chroot = None
-    os.fchdir = None
-    os.lchflags = None
     os.lchmod = None
     os.lchown = None
-    os.getcwd = None
+    os.lchflags = None
+
+    # Disable directory navigation functions
+    os.fchdir = None
+    os.chroot = None
     os.chdir = None
+    os.getcwd = None
 
+    # Disable shutil destructive operations
     import shutil
-
     shutil.rmtree = None
     shutil.move = None
     shutil.chown = None
 
+    # Disable subprocess to prevent shell command execution
     import subprocess
-
     subprocess.Popen = None  # type: ignore
 
+    # Disable help function (can leak information about the system)
     __builtins__["help"] = None
 
+    # Block potentially dangerous modules from being imported
     import sys
-
-    sys.modules["ipdb"] = None
-    sys.modules["joblib"] = None
-    sys.modules["resource"] = None
-    sys.modules["psutil"] = None
-    sys.modules["tkinter"] = None
+    sys.modules["ipdb"] = None  # debugger
+    sys.modules["joblib"] = None  # parallel processing
+    sys.modules["resource"] = None  # resource limits manipulation
+    sys.modules["psutil"] = None  # system/process utilities
+    sys.modules["tkinter"] = None  # GUI (can hang)
 
 
 def _unsafe_execute(code: str, timeout: float, maximum_memory_bytes: Optional[int], result_dict):
-    """Execute code in a subprocess with safety guards. Results are written to result_dict."""
+    """
+    Execute code in a subprocess with safety guards. Internal function.
+
+    This function runs in a separate process and communicates results back
+    through a shared dictionary. It applies multiple layers of protection:
+    1. Runs in a temporary directory (isolated file system)
+    2. Applies reliability guard (disables dangerous functions)
+    3. Captures stdout/stderr (prevents terminal output)
+    4. Enforces time limit (prevents infinite loops)
+    5. Enforces memory limit (prevents memory bombs)
+
+    Args:
+        code: Python code string to execute
+        timeout: Maximum execution time in seconds
+        maximum_memory_bytes: Memory limit in bytes (None to skip)
+        result_dict: Shared dictionary to write results to
+
+    Note:
+        This function is designed to run in a separate process created by
+        multiprocessing. It should not be called directly.
+    """
     with create_tempdir():
 
-        # These system calls are needed when cleaning up tempdir.
+        # Save references to system calls needed for cleanup
+        # We need to do this BEFORE calling reliability_guard which neuters them
         import os
         import shutil
 
@@ -224,10 +351,11 @@ def _unsafe_execute(code: str, timeout: float, maximum_memory_bytes: Optional[in
         chdir = os.chdir
         unlink = os.unlink
 
-        # Disable functionalities that can make destructive changes to the test.
+        # Disable destructive functions that could harm the system
         reliability_guard(maximum_memory_bytes=maximum_memory_bytes)
 
-        # Default to failure
+        # Initialize result dict with failure state
+        # If anything goes wrong, we want to report failure by default
         result_dict.update({
             "success": False,
             "stdout": "",
@@ -238,6 +366,8 @@ def _unsafe_execute(code: str, timeout: float, maximum_memory_bytes: Optional[in
         })
 
         try:
+            # Create a fresh namespace for code execution
+            # This prevents code from accessing local variables in this function
             exec_globals = {}
             with capture_io() as (stdout_capture, stderr_capture):
                 with time_limit(timeout):
@@ -253,6 +383,7 @@ def _unsafe_execute(code: str, timeout: float, maximum_memory_bytes: Optional[in
                     # uncomment the following line and proceed at your own risk:
                     exec(code, exec_globals)
 
+            # Success! Update result dict with captured output
             result_dict.update({
                 "success": True,
                 "stdout": stdout_capture.getvalue(),
@@ -260,23 +391,27 @@ def _unsafe_execute(code: str, timeout: float, maximum_memory_bytes: Optional[in
             })
 
         except TimeoutException:
+            # Code took too long to execute
             result_dict.update({
                 "timeout": True,
                 "error": "Execution timed out",
             })
 
         except MemoryError as e:
+            # Code exceeded memory limit
             result_dict.update({
                 "memory_exceeded": True,
                 "error": f"Memory limit exceeded: {e}",
             })
 
         except BaseException as e:
+            # Any other error (SyntaxError, RuntimeError, etc.)
             result_dict.update({
                 "error": f"{type(e).__name__}: {e}",
             })
 
-        # Needed for cleaning up.
+        # Restore system calls needed for cleanup
+        # The tempdir context manager needs these to clean up after itself
         shutil.rmtree = rmtree
         os.rmdir = rmdir
         os.chdir = chdir
@@ -289,7 +424,19 @@ def execute_code(
     maximum_memory_bytes: Optional[int] = 256 * 1024 * 1024, # 256MB default
 ) -> ExecutionResult:
     """
-    Execute Python code in a sandboxed environment.
+    Execute Python code in a sandboxed environment with safety constraints.
+
+    This is the main entry point for code execution. It provides:
+    - Process isolation: Code runs in a separate process
+    - Time limits: Prevents infinite loops
+    - Memory limits: Prevents memory bombs (on non-macOS systems)
+    - I/O capture: Captures stdout/stderr
+    - Filesystem isolation: Code runs in a temporary directory
+    - Disabled dangerous functions: Prevents destructive operations
+
+    The code is executed via exec() in a fresh namespace, with various
+    safety guards applied. If the process hangs or crashes, it will be
+    forcefully terminated.
 
     Args:
         code: Python code to execute as a string
@@ -305,18 +452,34 @@ def execute_code(
         True
         >>> result.stdout
         'hello world\\n'
+
+        >>> result = execute_code("1/0")
+        >>> result.success
+        False
+        >>> result.error
+        'ZeroDivisionError: division by zero'
+
+    Note:
+        - This is NOT a security sandbox, only defense-in-depth
+        - Do not execute untrusted code outside a proper sandbox
+        - See module docstring for details on what is/isn't protected
     """
 
+    # Create a manager for inter-process communication
     manager = multiprocessing.Manager()
     result_dict = manager.dict()
 
+    # Start code execution in a separate process for isolation
     p = multiprocessing.Process(
         target=_unsafe_execute,
         args=(code, timeout, maximum_memory_bytes, result_dict)
     )
     p.start()
+    # Wait for the process to complete, with a grace period of 1 second
+    # beyond the timeout (to allow the internal timeout handler to work)
     p.join(timeout=timeout + 1)
 
+    # If the process is still alive after timeout + 1 second, forcefully kill it
     if p.is_alive():
         p.kill()
         return ExecutionResult(
@@ -328,6 +491,7 @@ def execute_code(
             memory_exceeded=False,
         )
 
+    # If the process returned no results, something went seriously wrong
     if not result_dict:
         return ExecutionResult(
             success=False,
@@ -338,6 +502,7 @@ def execute_code(
             memory_exceeded=False,
         )
 
+    # Return the execution result from the subprocess
     return ExecutionResult(
         success=result_dict["success"],
         stdout=result_dict["stdout"],

@@ -1,36 +1,76 @@
 """
-Muon optimizer from Keller et al.
-Also a lot of borrowing of ideas from modded-nanogpt.
+Muon Optimizer - MomentUm Orthogonalized by Newton-schulz
+
+Implementation by Keller Jordan et al.
+Also incorporates ideas from modded-nanogpt.
+
+Muon is a novel optimizer that:
+1. Runs standard SGD with momentum
+2. Orthogonalizes the update using Newton-Schulz iteration
+3. Applies aspect-ratio scaling for rectangular weight matrices
+
+This approach is particularly effective for 2D weight matrices (linear layers, convolutions).
+Do NOT use Muon for embeddings, final layers, or 0D/1D parameters - use AdamW for those.
+
+Reference: https://kellerjordan.github.io/posts/muon/
 """
 import torch
 from torch import Tensor
 import torch.distributed as dist
 
-@torch.compile
+@torch.compile  # Compile for performance
 def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     """
-    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
-    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
-    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
-    zero even beyond the point where the iteration no longer converges all the way to one everywhere
-    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
-    where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
-    performance at all relative to UV^T, where USV^T = G is the SVD.
+    Compute the zeroth power (orthogonalization) of matrix G using Newton-Schulz iteration.
+
+    This function implements a quintic (degree 5) Newton-Schulz iteration optimized to maximize
+    convergence speed. The coefficients are tuned to maximize the slope at zero, which empirically
+    minimizes the number of iterations needed.
+
+    Mathematical details:
+    - Given SVD: G = USV^T
+    - Goal: Find UV^T (orthogonalized version)
+    - This implementation produces approximately US'V^T where S' has diagonal elements ~ Uniform(0.5, 1.5)
+    - Empirically, this approximation works just as well as perfect orthogonalization
+
+    Implementation notes:
+    - Works with batched matrices (ndim >= 2) for efficiency
+    - Operates in bfloat16 for speed and memory efficiency
+    - Handles rectangular matrices by transposing if needed
+
+    Credits:
+    - Batched implementation: @scottjmaddox
+    - Quintic strategy: @jxbz, @leloykun, @YouJiacheng
+    - Production deployment: @YouJiacheng
+
+    Args:
+        G: Input matrix to orthogonalize (shape: [..., m, n])
+        steps: Number of Newton-Schulz iterations (typically 5)
+
+    Returns:
+        Orthogonalized matrix with same shape as G
     """
-    assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
+    assert G.ndim >= 2  # Support batched Muon for efficiency
+    # Quintic iteration coefficients (optimized for fast convergence)
     a, b, c = (3.4445, -4.7750,  2.0315)
+
+    # Convert to bfloat16 for efficiency
     X = G.bfloat16()
+
+    # Transpose if taller than wide (for numerical stability)
     if G.size(-2) > G.size(-1):
         X = X.mT
 
-    # Ensure spectral norm is at most 1
+    # Normalize: ensure spectral norm ≤ 1 (required for convergence)
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
-    # Perform the NS iterations
-    for _ in range(steps):
-        A = X @ X.mT
-        B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
-        X = a * X + B @ X
 
+    # Perform Newton-Schulz iterations
+    for _ in range(steps):
+        A = X @ X.mT  # Gram matrix
+        B = b * A + c * A @ A  # Quintic polynomial: optimized computation strategy
+        X = a * X + B @ X  # Update step
+
+    # Transpose back if we transposed earlier
     if G.size(-2) > G.size(-1):
         X = X.mT
     return X

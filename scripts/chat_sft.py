@@ -1,12 +1,41 @@
 """
-Finetune a base model to be a chat model.
-Run on one GPU e.g. for debugging:
+Chat Model Supervised Fine-Tuning (SFT) Script
 
-python -m scripts.chat_sft
+This script performs supervised fine-tuning on a base or midtrained model to create
+a chat-capable model. SFT teaches the model to follow the conversational format and
+respond appropriately to user messages.
 
-Or torchrun for training:
+The training data mixture includes:
+- ARC-Easy & ARC-Challenge: Multiple choice science questions (3.4K examples)
+- GSM8K: Math word problems with calculator tool use (8K examples)
+- SmolTalk: General conversation examples (10K examples)
+- Identity conversations: Model identity and meta-knowledge (1K examples)
+- Spelling tasks: Simple spelling and character counting (600 examples)
+Total: ~23K training examples
 
-torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft
+Key SFT training details:
+- Uses conversation format with special tokens: <|user_start|>, <|user_end|>, etc.
+- Only trains on assistant responses (user messages are masked out in loss)
+- Variable-length sequences require dynamic batching with padding
+- Lower learning rate than pretraining (init_lr_frac=0.02)
+- Trains for 1 epoch by default
+- Evaluates on SmolTalk validation set and task-specific metrics
+
+Usage examples:
+
+Single GPU (for debugging):
+    python -m scripts.chat_sft
+
+Distributed training on 8 GPUs:
+    torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft
+
+Load from specific source checkpoint:
+    python -m scripts.chat_sft --source=mid --model_tag=d20 --step=5000
+
+Custom training hyperparameters:
+    python -m scripts.chat_sft --num_epochs=2 --target_examples_per_step=64
+
+The script saves the SFT model to chatsft_checkpoints/<model_tag>/ directory.
 """
 
 import os
@@ -96,6 +125,25 @@ val_ds = SmolTalk(split="test") # general conversations, 24K rows (though we don
 # DataLoader
 
 def sft_data_generator(dataset, batch_size):
+    """
+    Generator that yields batches of tokenized conversations for supervised fine-tuning.
+
+    This generator handles the complex task of preparing conversation data for training:
+    - Each conversation has variable length, so padding is required
+    - Only assistant responses are supervised (user messages masked with -1)
+    - Sequences are packed into batches with padding to the longest sequence
+    - In distributed setting, each rank processes different subset of data
+
+    Args:
+        dataset: Task dataset to sample from
+        batch_size: Number of conversations per batch (per GPU)
+
+    Yields:
+        Tuple of (inputs, targets) where:
+        - inputs: Padded batch of input token IDs, shape (batch_size, max_len)
+        - targets: Padded batch of target token IDs, shape (batch_size, max_len)
+                   Positions to ignore in loss are marked with -1
+    """
     pad_token_id = tokenizer.encode_special("<|assistant_end|>") # use <|assistant_end|> as the pad token is ok, these positions are masked in the loss
     # prepares a list of tokenized conversations into a batch and yields
     def collate_and_yield(batch):

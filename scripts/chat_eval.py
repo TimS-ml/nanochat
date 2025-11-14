@@ -1,11 +1,47 @@
 """
-Evaluate the Chat model.
-All the generic code lives here, and all the evlauation-specific
-code lives in nanochat directory and is imported from here.
+Chat Model Evaluation Script
 
-Example runs:
-python -m scripts.chat_eval -a ARC-Easy
-torchrun --nproc_per_node=8 -m scripts.chat_eval -- -a ARC-Easy
+This script evaluates chat-capable models on a variety of benchmarks to measure their
+reasoning, knowledge, and problem-solving capabilities. It supports two evaluation modes:
+
+1. Generative evaluation: Generate full responses and check correctness
+   - Used for: HumanEval (code), GSM8K (math), SpellingBee
+   - Supports pass@k metrics (probability at least 1 of k samples is correct)
+   - Slower but more realistic (models must generate full solutions)
+
+2. Categorical evaluation: Check logits for multiple-choice answers
+   - Used for: ARC, MMLU (multiple choice questions)
+   - Much faster (no sampling required, just forward pass)
+   - Can batch many examples at once
+
+The ChatCORE metric is computed as the average centered accuracy across all tasks,
+where centered accuracy = (acc - baseline) / (1 - baseline). This ranges from 0
+(random performance) to 1 (perfect performance).
+
+Benchmark tasks:
+- ARC-Easy: Elementary science questions (25% baseline)
+- ARC-Challenge: Harder science questions (25% baseline)
+- MMLU: Massive multitask language understanding (25% baseline)
+- GSM8K: Grade school math problems (0% baseline, generative)
+- HumanEval: Python coding problems (0% baseline, generative)
+- SpellingBee: Character counting task (0% baseline, generative)
+
+Usage examples:
+
+Evaluate on all tasks (single GPU):
+    python -m scripts.chat_eval -i sft
+
+Evaluate on specific task (multi-GPU):
+    torchrun --nproc_per_node=8 -m scripts.chat_eval -- -i sft -a ARC-Easy
+
+Multiple tasks at once:
+    python -m scripts.chat_eval -i sft -a "ARC-Easy|MMLU|GSM8K"
+
+Pass@k evaluation for GSM8K:
+    python -m scripts.chat_eval -i rl -a GSM8K -n 16 -t 1.0
+
+The script logs results to console and experiment report, including the ChatCORE metric
+if all tasks were evaluated.
 """
 
 import argparse
@@ -29,6 +65,29 @@ from tasks.spellingbee import SpellingBee
 # Generative evaluation loop (we go one problem at a time, sample, evaluate)
 
 def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=None):
+    """
+    Evaluate a chat model on a generative task (requires full text generation).
+
+    For each problem:
+    1. Tokenize the conversation prompt
+    2. Generate K completions from the model
+    3. Decode and evaluate each completion
+    4. Record pass@k (did at least 1 completion succeed?)
+
+    Args:
+        task_object: Task dataset with evaluate() method
+        tokenizer: Tokenizer for encoding/decoding
+        model: Chat model to evaluate
+        engine: Generation engine for sampling
+        num_samples: Number of completions to generate per problem (k in pass@k)
+        max_new_tokens: Maximum tokens to generate per completion
+        temperature: Sampling temperature (0 = greedy, higher = more random)
+        top_k: Top-k sampling parameter (only sample from top k tokens)
+        max_problems: Maximum number of problems to evaluate (None = all)
+
+    Returns:
+        Accuracy (float): Fraction of problems where at least 1 completion was correct
+    """
 
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     device = model.get_device()
@@ -88,6 +147,31 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
 # batches at a time and just check the logits for correct answer choices.
 
 def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems=None):
+    """
+    Evaluate a chat model on a categorical task (multiple choice, no generation needed).
+
+    This is much more efficient than generative evaluation because:
+    - No sampling required, just one forward pass
+    - Can batch many problems at once
+    - Only need to check logits for the answer choices (A, B, C, D)
+
+    For each problem:
+    1. Encode the conversation up to the answer position
+    2. Run forward pass to get logits
+    3. Focus on logits for valid answer letters (e.g., A, B, C, D)
+    4. Pick the letter with highest logit
+    5. Check if it matches the correct answer
+
+    Args:
+        task_object: Task dataset with evaluate() method and 'letters' field
+        tokenizer: Tokenizer for encoding/decoding
+        model: Chat model to evaluate
+        batch_size: Number of problems to process in parallel
+        max_problems: Maximum number of problems to evaluate (None = all)
+
+    Returns:
+        Accuracy (float): Fraction of problems answered correctly
+    """
 
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     device = model.get_device()
