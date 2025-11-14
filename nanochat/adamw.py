@@ -19,11 +19,13 @@ class DistAdamW(torch.optim.Optimizer):
     @torch.compile
     @torch.no_grad()
     def step(self):
+        """Run one optimizer iteration on the local shard and sync parameters."""
         rank = dist.get_rank()
         world_size = dist.get_world_size()
         reduce_scatter_futures: list[torch.Future] = []
         all_reduce_futures: list[torch.Future] = []
         grad_slices = []
+        # Kick off async reduce-scatter so each rank receives its shard of every gradient.
         for group in self.param_groups:
             params: list[Tensor] = group["params"]
             for base_i in range(len(params)):
@@ -47,7 +49,7 @@ class DistAdamW(torch.optim.Optimizer):
                 lr = group['lr'] * getattr(p, "lr_mul", 1.0)
                 state = self.state[p]
                 g_slice = grad_slices[idx]
-                # State init
+                # Lazily initialize optimizer state on the first update for this parameter shard.
                 if not state:
                     state['step'] = torch.tensor(0, dtype=torch.int64, device=p.device)
                     state['exp_avg'] = torch.zeros_like(p_slice)
@@ -56,11 +58,11 @@ class DistAdamW(torch.optim.Optimizer):
                 exp_avg_sq = state['exp_avg_sq']
                 state['step'] += 1
                 t = state['step']
-                # weight decay
+                # Apply AdamW-style decoupled weight decay on the local shard only.
                 if wd != 0:
                     eff_weight_decay = lr * wd * getattr(p, "wd_mul", 1.0)
                     p_slice.mul_(1 - eff_weight_decay)
-                # update running averages
+                # Update Adam running averages with the sharded gradient.
                 exp_avg.mul_(beta1).add_(g_slice, alpha=1 - beta1)
                 exp_avg_sq.mul_(beta2).addcmul_(g_slice, g_slice, value=1 - beta2)
                 # bias corrections
@@ -72,5 +74,6 @@ class DistAdamW(torch.optim.Optimizer):
                 update = exp_avg.div(denom).mul_(step_size)
                 p_slice.add_(other=update, alpha=-1.0)
                 idx += 1
+                # Broadcast the updated shard back to all ranks so parameters remain replicated.
                 all_reduce_futures.append(dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future())
         torch.futures.collect_all(all_reduce_futures).wait()
