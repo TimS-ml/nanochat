@@ -1,5 +1,7 @@
 """
-Chat Model Evaluation Script
+Evaluate the Chat model.
+All the generic code lives here, and all the evaluation-specific
+code lives in nanochat directory and is imported from here.
 
 This script evaluates chat-capable models on a variety of benchmarks to measure their
 reasoning, knowledge, and problem-solving capabilities. It supports two evaluation modes:
