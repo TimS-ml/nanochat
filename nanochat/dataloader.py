@@ -82,25 +82,23 @@ def tokenizing_distributed_data_loader_with_state(B, T, split, tokenizer_threads
         # Determine starting position (for resumption or fresh start)
         resume_pq_idx = resume_state_dict["pq_idx"] if resume_state_dict is not None else 0
         resume_rg_idx = resume_state_dict["rg_idx"] if resume_state_dict is not None else None
-        pq_idx = resume_pq_idx  # Start from resume point or beginning
-
-        while True:  # Infinite multi-epoch iteration
-            while pq_idx < len(parquet_paths):  # Iterate over parquet files
+        first_pass = True
+        pq_idx = resume_pq_idx # we kick off parquet files at the resume index (or by default just 0)
+        while True: # iterate infinitely (multi-epoch)
+            pq_idx = resume_pq_idx if first_pass else 0
+            while pq_idx < len(parquet_paths): # iterate over all parquet files
                 filepath = parquet_paths[pq_idx]
                 pf = pq.ParquetFile(filepath)
-
-                # Determine starting row group index
-                # This logic is a bit tricky due to approximate resumption + DDP
-                if resume_rg_idx is not None:
-                    # Resuming from a checkpoint
-                    # Convert row group index to base units (chunks of world_size)
-                    base_idx = resume_rg_idx // ddp_world_size
-                    # Advance by 1 to avoid repeating data
-                    base_idx += 1
-                    # Each rank processes different row groups (strided by world_size)
+                # Start from resume point if resuming on same file, otherwise from DDP rank
+                # I know this state resumption is a little bit tricky and a little bit hacky... sigh.
+                if first_pass and (resume_rg_idx is not None) and (pq_idx == resume_pq_idx):
+                    base_idx = resume_rg_idx // ddp_world_size # in units of ddp_world_size
+                    base_idx += 1 # advance by 1 so that we definitely don't repeat data after resuming
                     rg_idx = base_idx * ddp_world_size + ddp_rank
-                    # Clear resume flag (only applies to first file)
-                    resume_rg_idx = None
+                    if rg_idx >= pf.num_row_groups:
+                        pq_idx += 1
+                        continue
+                    resume_rg_idx = None # set to None as we only want to do this a single time
                 else:
                     # Fresh start: each rank starts at its rank offset
                     rg_idx = ddp_rank
@@ -115,13 +113,9 @@ def tokenizing_distributed_data_loader_with_state(B, T, split, tokenizer_threads
                     # This allows better parallelization in the tokenizer
                     for i in range(0, len(batch), tokenizer_batch_size):
                         yield batch[i:i+tokenizer_batch_size], (pq_idx, rg_idx)
-
-                    # Advance to next row group for this rank (strided by world_size)
-                    rg_idx += ddp_world_size
-
-                # Move to next parquet file
-                pq_idx += 1
-
+                    rg_idx += ddp_world_size # advance to the next row group (in DDP)
+                pq_idx += 1 # advance to the next parquet file
+            first_pass = False
     batches = document_batches()
 
     # -------------------------------------------------------------------------
