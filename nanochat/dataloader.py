@@ -76,7 +76,7 @@ def tokenizing_distributed_data_loader_with_state(B, T, split, tokenizer_threads
         - Resumption from a specific parquet file and row group
         """
         parquet_paths = list_parquet_files()
-        # Split dataset: all but last file for train, last file for validation
+        assert len(parquet_paths) != 0, "No dataset parquet files found, did you run dataset.py?"
         parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
 
         # Determine starting position (for resumption or fresh start)

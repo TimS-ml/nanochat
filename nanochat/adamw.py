@@ -61,6 +61,7 @@ class DistAdamW(torch.optim.Optimizer):
         for group in self.param_groups:
             params: list[Tensor] = group["params"]
             for base_i in range(len(params)):
+                assert params[base_i].shape[0] % world_size == 0, f"First dim of parameter shape {params[base_i].shape} must be divisible by world size {world_size}"
                 grad = params[base_i].grad
                 # Calculate size of this rank's slice
                 rank_size = grad.shape[0] // world_size

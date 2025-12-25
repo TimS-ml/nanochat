@@ -203,32 +203,24 @@ class Block(nn.Module):
 
 
 class GPT(nn.Module):
-    """
-    GPT (Generative Pre-trained Transformer) language model.
-
-    Architecture highlights:
-    - Rotary position embeddings (RoPE) instead of learned absolute positions
-    - QK normalization in attention for stability
-    - Untied weights: separate embeddings for input tokens and output predictions
-    - ReLU^2 activation in MLP layers
-    - Pre-normalization (norm before attention/MLP)
-    - No bias terms in linear layers
-    - Multi-Query Attention (MQA) support for efficient inference
-    """
-    def __init__(self, config):
+    def __init__(self, config, pad_vocab_size_to=64):
         super().__init__()
         self.config = config
+        # For DDP, we want vocab_size divisible by world_size. Also, there are potential performance benefits, see:
+        # https://huggingface.co/docs/transformers/main_classes/model#transformers.PreTrainedModel.resize_token_embeddings
+        padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
+        if padded_vocab_size != config.vocab_size:
+            print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} to be divisible by {pad_vocab_size_to}")
         self.transformer = nn.ModuleDict({
-            "wte": nn.Embedding(config.vocab_size, config.n_embd),  # Token embeddings
-            "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),  # Transformer blocks
+            "wte": nn.Embedding(padded_vocab_size, config.n_embd),
+            "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
-        # Language model head: untied from input embeddings (not weight-shared)
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-
-        # Pre-compute rotary position embeddings
-        # To support meta device initialization, we init the rotary embeddings here
-        # We over-allocate by 10x to avoid recomputation, trading memory for convenience
-        self.rotary_seq_len = config.sequence_len * 10  # 10x buffer for longer sequences
+        self.lm_head = nn.Linear(config.n_embd, padded_vocab_size, bias=False)
+        # To support meta device initialization, we init the rotary embeddings here, but it's fake
+        # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
+        # so let's just over-compute them, but assert fail if we ever reach that amount.
+        # In the future we can dynamically grow the cache, for now it's fine.
+        self.rotary_seq_len = config.sequence_len * 10 # 10X over-compute should be enough, TODO make nicer?
         head_dim = config.n_embd // config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         # Register as buffers (not parameters) and non-persistent (not saved in checkpoints)
@@ -375,8 +367,7 @@ class GPT(nn.Module):
         # Create the AdamW optimizer for the embedding and lm_head
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
-        if rank == 0:
-            print(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
+        print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
         adam_groups = [
             dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale),
             dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale),
@@ -415,7 +406,8 @@ class GPT(nn.Module):
 
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
-        logits = self.lm_head(x) # (B, T, vocab_size) <- very big tensor, large amount of memory
+        logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
+        logits = logits[..., :self.config.vocab_size] # slice to remove padding
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
         logits = softcap * torch.tanh(logits / softcap) # squash the logits
 
