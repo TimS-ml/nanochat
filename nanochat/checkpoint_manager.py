@@ -54,6 +54,8 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
     - model_<step>.pt: Model weights (rank 0 only)
     - meta_<step>.json: Training metadata (rank 0 only)
     - optim_<step>_rank<N>.pt: Optimizer state (per-rank)
+
+    Checkout nanochat/base_train.py for optimizer_data resume
     """
     if rank == 0:
         os.makedirs(checkpoint_dir, exist_ok=True)

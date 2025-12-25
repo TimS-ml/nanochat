@@ -172,7 +172,8 @@ def fast_merge_inplace(ids, pair, idx):
     of pair with the new integer token idx in place
     Example: ids=[1, 2, 3, 1, 2], pair=(1, 2), idx=4 -> [4, 3, 4]
     """
-    # Find all positions where the pair occurs
+    # Faster than allocating a new list on every merge:
+    # we mutate ids in place and pop the second element of the pair.
     i = 0
     while i < len(ids) - 1:
         if ids[i] == pair[0] and ids[i+1] == pair[1]:
@@ -222,6 +223,8 @@ class FastRegexTokenizer:
         text_chunks = re.findall(self.compiled_pattern, text)
 
         # many, many chunks are identical, so we can "collapse" them to just the unique ones
+        # This collapses duplicate chunks so we only process each unique chunk once,
+        # weighting it by how many times it occurs in the corpus.
         counts = Counter(text_chunks)
         unique_chunks = [ch for ch, count in counts.items()]
         chunk_counts = [count for ch, count in counts.items()]
@@ -233,9 +236,12 @@ class FastRegexTokenizer:
         vocab = {idx: bytes([idx]) for idx in range(256)} # idx -> bytes
 
         # Initial count: build stats and position tracking
+        # stats stores global frequencies; positions tracks which chunks contain each pair
+        # so that later updates only touch affected chunks instead of rescanning everything.
         stats = defaultdict(int)
         positions = defaultdict(set)  # pair -> set of chunk indices that contain this pair
 
+        # NOTE: += count here
         for chunk_idx, (chunk_ids, count) in enumerate(zip(ids, chunk_counts)):
             for pair in zip(chunk_ids, chunk_ids[1:]):
                 stats[pair] += count
